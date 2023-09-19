@@ -255,3 +255,32 @@ fn test_init_error_request() {
         None => false,
     });
 }
+
+
+// /runtime/restore/next
+struct SnapshotRestoreRequest;
+
+impl IntoRequest for SnapshotRestoreRequest {
+    fn into_req(self) -> Result<Request<Body>, Error> {
+        let uri = "/2018-06-01/runtime/restore/next".to_string();
+        let uri = Uri::from_str(&uri)?;
+
+        let req = build_request()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())?;
+        Ok(req)
+    }
+}
+
+#[test]
+fn test_snapshot_restore_request() {
+    let req = SnapshotRestoreRequest;
+    let req = req.into_req().unwrap();
+    assert_eq!(req.method(), Method::GET);
+    assert_eq!(req.uri(), &Uri::from_static("/2018-06-01/runtime/restore/next"));
+    assert!(match req.headers().get("User-Agent") {
+        Some(header) => header.to_str().unwrap().starts_with("aws-lambda-rust/"),
+        None => false,
+    });
+}
