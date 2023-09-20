@@ -56,6 +56,8 @@ pub struct Config {
     pub log_stream: String,
     /// The name of the Amazon CloudWatch Logs group for the function.
     pub log_group: String,
+    /// The initialization type of the function
+    pub init_type: String,
 }
 
 impl Config {
@@ -70,6 +72,7 @@ impl Config {
             version: env::var("AWS_LAMBDA_FUNCTION_VERSION").expect("Missing AWS_LAMBDA_FUNCTION_VERSION env var"),
             log_stream: env::var("AWS_LAMBDA_LOG_STREAM_NAME").unwrap_or_default(),
             log_group: env::var("AWS_LAMBDA_LOG_GROUP_NAME").unwrap_or_default(),
+            init_type: env::var("AWS_LAMBDA_INITIALIZATION_TYPE").expect("Missing AWS_LAMBDA_INITIALIZATION_TYPE env var"),
         };
         Ok(conf)
     }
