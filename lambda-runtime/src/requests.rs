@@ -258,7 +258,7 @@ fn test_init_error_request() {
 
 
 // /runtime/restore/next
-struct SnapshotRestoreRequest;
+pub struct SnapshotRestoreRequest;
 
 impl IntoRequest for SnapshotRestoreRequest {
     fn into_req(self) -> Result<Request<Body>, Error> {
@@ -279,6 +279,57 @@ fn test_snapshot_restore_request() {
     let req = req.into_req().unwrap();
     assert_eq!(req.method(), Method::GET);
     assert_eq!(req.uri(), &Uri::from_static("/2018-06-01/runtime/restore/next"));
+    assert!(match req.headers().get("User-Agent") {
+        Some(header) => header.to_str().unwrap().starts_with("aws-lambda-rust/"),
+        None => false,
+    });
+}
+
+// /runtime/restore/error
+pub struct RestoreErrorRequest<'a> {
+    pub(crate) diagnostic: Diagnostic<'a>,
+}
+
+impl<'a> RestoreErrorRequest<'a> {
+    pub(crate) fn new(error_type: &'a str, error_message: &'a str) -> RestoreErrorRequest<'a> {
+        RestoreErrorRequest {
+            diagnostic: Diagnostic {
+                error_type,
+                error_message,
+            },
+        }
+    }
+}
+
+impl<'a> IntoRequest for RestoreErrorRequest<'a> {
+    fn into_req(self) -> Result<Request<Body>, Error> {
+        let uri = "/2018-06-01/runtime/restore/error".to_string();
+        let uri = Uri::from_str(&uri)?;
+
+        let body = serde_json::to_vec(&self.diagnostic)?;
+        let body = Body::from(body);
+
+        let req = build_request()
+            .method(Method::POST)
+            .uri(uri)
+            .header("lambda-runtime-function-error-type", "unhandled")
+            .body(body)?;
+        Ok(req)
+    }
+}
+
+#[test]
+fn test_restore_error_request() {
+    let req = RestoreErrorRequest {
+        diagnostic: Diagnostic {
+            error_type: "AfterRestoreError",
+            error_message: "Error running afterRestore",
+        },
+    };
+    let req = req.into_req().unwrap();
+    let expected = Uri::from_static("/2018-06-01/runtime/restore/error");
+    assert_eq!(req.method(), Method::POST);
+    assert_eq!(req.uri(), &expected);
     assert!(match req.headers().get("User-Agent") {
         Some(header) => header.to_str().unwrap().starts_with("aws-lambda-rust/"),
         None => false,
