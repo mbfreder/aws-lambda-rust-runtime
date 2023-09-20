@@ -87,9 +87,22 @@ where
     service_fn(move |req: LambdaEvent<A>| f(req.payload, req.context))
 }
 
+/// A trait for receiving checkpoint/restore notifications.
+/// 
+/// The type that is interested in receiving a checkpoint/restore notification
+/// implements this trait, and the instance created from that type is registered
+/// inside the Runtime's list of resources, using the Runtime's register() method.
+pub trait Resource {
+    /// Invoked by Runtime as a notification about checkpoint (that snapshot is about to be taken)
+    fn before_checkpoint(&self);
+    /// Invoked by Runtime as a notification about restore (snapshot was restored)
+    fn after_restore(&self);
+}
+
 struct Runtime<C: Service<http::Uri> = HttpConnector> {
     client: Client<C>,
     config: Config,
+    resources: Vec<Box<dyn Resource>>
 }
 
 impl<C> Runtime<C>
@@ -213,6 +226,10 @@ where
         }
         Ok(())
     }
+
+    fn register(& mut self, resource: Box<dyn Resource>) {
+        self.resources.push(resource)
+    }
 }
 
 fn incoming<C>(client: &Client<C>) -> impl Stream<Item = Result<http::Response<hyper::Body>, Error>> + Send + '_
@@ -266,8 +283,9 @@ where
     trace!("Loading config from env");
     let config = Config::from_env()?;
     let client = Client::builder().build().expect("Unable to create a runtime client");
-    let runtime = Runtime { client, config };
-
+    let resources = Vec::new();
+    let runtime = Runtime { client, config, resources};
+    
     let client = &runtime.client;
     let incoming = incoming(client);
     runtime.run(incoming, handler).await
@@ -536,7 +554,9 @@ mod endpoint_tests {
         }
         let config = crate::Config::from_env().expect("Failed to read env vars");
 
-        let runtime = Runtime { client, config };
+        let resources = Vec::new();
+
+        let runtime = Runtime { client, config, resources};
         let client = &runtime.client;
         let incoming = incoming(client).take(1);
         runtime.run(incoming, f).await?;
@@ -577,9 +597,11 @@ mod endpoint_tests {
             version: "1".to_string(),
             log_stream: "test_stream".to_string(),
             log_group: "test_log".to_string(),
+            init_type: "snap-start".to_string(),
         };
 
-        let runtime = Runtime { client, config };
+        let resources = Vec::new();
+        let runtime = Runtime { client, config, resources};
         let client = &runtime.client;
         let incoming = incoming(client).take(1);
         runtime.run(incoming, f).await?;
