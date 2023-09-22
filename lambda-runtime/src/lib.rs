@@ -30,6 +30,7 @@ pub use tower::{self, service_fn, Service};
 use tower::{util::ServiceFn, ServiceExt};
 use tracing::{error, trace, Instrument};
 
+mod crac;
 mod deserializer;
 mod requests;
 #[cfg(test)]
@@ -39,6 +40,8 @@ mod types;
 
 use requests::{EventCompletionRequest, EventErrorRequest, IntoRequest, NextEventRequest};
 pub use types::{Context, FunctionResponse, IntoFunctionResponse, LambdaEvent, MetadataPrelude, StreamResponse};
+
+use crate::requests::SnapshotRestoreRequest;
 
 /// Error type that lambdas may result in
 pub type Error = lambda_runtime_api_client::Error;
@@ -87,32 +90,34 @@ where
     service_fn(move |req: LambdaEvent<A>| f(req.payload, req.context))
 }
 
-/// A trait for receiving checkpoint/restore notifications.
-/// 
-/// The type that is interested in receiving a checkpoint/restore notification
-/// implements this trait, and the instance created from that type is registered
-/// inside the Runtime's list of resources, using the Runtime's register() method.
-pub trait Resource {
-    /// Invoked by Runtime as a notification about checkpoint (that snapshot is about to be taken)
-    fn before_checkpoint(&self);
-    /// Invoked by Runtime as a notification about restore (snapshot was restored)
-    fn after_restore(&self);
-}
-
-struct Runtime<C: Service<http::Uri> = HttpConnector> {
-    client: Client<C>,
+/// Runtime Object which takes care of storing crac::Resource and starting the Lambda Rust Runtime
+pub struct Runtime<T: crac::Resource> {
+    client: Client<HttpConnector>,
     config: Config,
-    resources: Vec<Box<dyn Resource>>
+    resources: Vec<T>,
 }
 
-impl<C> Runtime<C>
-where
-    C: Service<http::Uri> + Clone + Send + Sync + Unpin + 'static,
-    C::Future: Unpin + Send,
-    C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    C::Response: AsyncRead + AsyncWrite + Connection + Unpin + Send + 'static,
-{
-    async fn run<F, A, R, B, S, D, E>(
+impl<T: crac::Resource> Runtime<T> {
+
+    /// Creates a new Runtime Object
+    pub fn new() -> Self {
+        trace!("Loading config from env");
+        let config = Config::from_env().expect("Unable to parse config from environment variables");
+        let client = Client::builder().build().expect("Unable to create a runtime client");
+        Runtime {
+            client,
+            config,
+            resources: Vec::new(),
+        }
+    }
+
+    /// Registers a crac::Resource to the Runtime
+    pub fn register(&mut self, resource: T) -> &mut Self {
+        self.resources.push(resource);
+        self
+    }
+
+    async fn execute<F, A, R, B, S, D, E>(
         &self,
         incoming: impl Stream<Item = Result<http::Response<hyper::Body>, Error>> + Send,
         mut handler: F,
@@ -130,6 +135,27 @@ where
     {
         let client = &self.client;
         tokio::pin!(incoming);
+
+        // If snap-start is enabled
+        let config = &self.config;
+        if config.init_type == "snap-start" {
+            let resources = &self.resources;
+            // Run the Resources beforeCheckpoint() methods
+            for resource in resources {
+                resource.before_checkpoint();
+            }
+            // Send request to RAPID /restore/next API, will return after taking snapshot.
+            // This will also be the 'entrypoint' when resuming from snapshots.
+            let req = SnapshotRestoreRequest.into_req().expect("Unable to contrust request");
+            let _res = self.client.call(req).await;
+
+            // Run the Resources afterRestore() methods
+            for resource in resources {
+                resource.after_restore();
+            }
+
+        }
+
         while let Some(next_event_response) = incoming.next().await {
             trace!("New event arrived (run loop)");
             let event = next_event_response?;
@@ -227,9 +253,41 @@ where
         Ok(())
     }
 
-    fn register(& mut self, resource: Box<dyn Resource>) {
-        self.resources.push(resource)
+    /// Starts the Lambda Rust runtime and begins polling for events on the [Lambda
+    /// Runtime APIs](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html).
+    ///
+    /// # Example
+    /// ```no_run
+    /// use lambda_runtime::{Error, service_fn, LambdaEvent};
+    /// use serde_json::Value;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Error> {
+    ///     let func = service_fn(func);
+    ///     lambda_runtime::run(func).await?;
+    ///     Ok(())
+    /// }
+    ///
+    /// async fn func(event: LambdaEvent<Value>) -> Result<Value, Error> {
+    ///     Ok(event.payload)
+    /// }
+    /// ```
+    pub async fn run<A, F, R, B, S, D, E>(&self, handler: F) -> Result<(), Error>
+    where
+        F: Service<LambdaEvent<A>>,
+        F::Future: Future<Output = Result<R, F::Error>>,
+        F::Error: fmt::Debug + fmt::Display,
+        A: for<'de> Deserialize<'de>,
+        R: IntoFunctionResponse<B, S>,
+        B: Serialize,
+        S: Stream<Item = Result<D, E>> + Unpin + Send + 'static,
+        D: Into<Bytes> + Send,
+        E: Into<Error> + Send + Debug,
+    {
+        let incoming = incoming(&self.client);
+        self.execute(incoming, handler).await
     }
+
 }
 
 fn incoming<C>(client: &Client<C>) -> impl Stream<Item = Result<http::Response<hyper::Body>, Error>> + Send + '_
@@ -247,48 +305,6 @@ where
             yield res;
         }
     }
-}
-
-/// Starts the Lambda Rust runtime and begins polling for events on the [Lambda
-/// Runtime APIs](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html).
-///
-/// # Example
-/// ```no_run
-/// use lambda_runtime::{Error, service_fn, LambdaEvent};
-/// use serde_json::Value;
-///
-/// #[tokio::main]
-/// async fn main() -> Result<(), Error> {
-///     let func = service_fn(func);
-///     lambda_runtime::run(func).await?;
-///     Ok(())
-/// }
-///
-/// async fn func(event: LambdaEvent<Value>) -> Result<Value, Error> {
-///     Ok(event.payload)
-/// }
-/// ```
-pub async fn run<A, F, R, B, S, D, E>(handler: F) -> Result<(), Error>
-where
-    F: Service<LambdaEvent<A>>,
-    F::Future: Future<Output = Result<R, F::Error>>,
-    F::Error: fmt::Debug + fmt::Display,
-    A: for<'de> Deserialize<'de>,
-    R: IntoFunctionResponse<B, S>,
-    B: Serialize,
-    S: Stream<Item = Result<D, E>> + Unpin + Send + 'static,
-    D: Into<Bytes> + Send,
-    E: Into<Error> + Send + Debug,
-{
-    trace!("Loading config from env");
-    let config = Config::from_env()?;
-    let client = Client::builder().build().expect("Unable to create a runtime client");
-    let resources = Vec::new();
-    let runtime = Runtime { client, config, resources};
-    
-    let client = &runtime.client;
-    let incoming = incoming(client);
-    runtime.run(incoming, handler).await
 }
 
 fn type_name_of_val<T>(_: T) -> &'static str {
@@ -521,11 +537,11 @@ mod endpoint_tests {
         });
         let conn = simulated::Connector::with(base.clone(), DuplexStreamWrapper::new(client))?;
 
-        let client = Client::builder()
-            .with_endpoint(base)
-            .with_connector(conn)
-            .build()
-            .expect("Unable to build client");
+        let _client = Client::builder()
+           .with_endpoint(base)
+           .with_connector(conn)
+           .build()
+           .expect("Unable to build client");
 
         async fn func(event: crate::LambdaEvent<serde_json::Value>) -> Result<serde_json::Value, Error> {
             let (event, _) = event.into_parts();
@@ -552,14 +568,13 @@ mod endpoint_tests {
         if env::var("AWS_LAMBDA_LOG_GROUP_NAME").is_err() {
             env::set_var("AWS_LAMBDA_LOG_GROUP_NAME", "test_log");
         }
-        let config = crate::Config::from_env().expect("Failed to read env vars");
+        let _config = crate::Config::from_env().expect("Failed to read env vars");
 
-        let resources = Vec::new();
-
-        let runtime = Runtime { client, config, resources};
+        let mut runtime = Runtime::new();
+        runtime.register(());
         let client = &runtime.client;
-        let incoming = incoming(client).take(1);
-        runtime.run(incoming, f).await?;
+        let _incoming = incoming(client).take(1);
+        runtime.run(f).await?;
 
         // shutdown server
         tx.send(()).expect("Receiver has been dropped");
@@ -583,7 +598,7 @@ mod endpoint_tests {
         });
         let conn = simulated::Connector::with(base.clone(), DuplexStreamWrapper::new(client))?;
 
-        let client = Client::builder()
+        let _client = Client::builder()
             .with_endpoint(base)
             .with_connector(conn)
             .build()
@@ -591,7 +606,7 @@ mod endpoint_tests {
 
         let f = crate::service_fn(func);
 
-        let config = crate::Config {
+        let _config = crate::Config {
             function_name: "test_fn".to_string(),
             memory: 128,
             version: "1".to_string(),
@@ -600,11 +615,11 @@ mod endpoint_tests {
             init_type: "snap-start".to_string(),
         };
 
-        let resources = Vec::new();
-        let runtime = Runtime { client, config, resources};
+        let mut runtime = Runtime::new();
+        runtime.register(());
         let client = &runtime.client;
-        let incoming = incoming(client).take(1);
-        runtime.run(incoming, f).await?;
+        let _incoming = incoming(client).take(1);
+        runtime.run(f).await?;
 
         match server.await {
             Ok(_) => Ok(()),
